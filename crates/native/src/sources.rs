@@ -1,0 +1,170 @@
+//! Passive inventory and explicit import; never runs native code.
+use crate::{Error, Result, files};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Params {
+    project: PathBuf,
+    home: PathBuf,
+    import: Option<Import>,
+    #[serde(default)]
+    settings: Settings,
+}
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Settings {
+    #[serde(default)]
+    environment_names: Vec<String>,
+    view: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Import {
+    path: PathBuf,
+    format: String,
+}
+pub(crate) fn call(harness: &str, params: &Value) -> Result<Value> {
+    if params.get("action").is_some() {
+        return crate::source_actions::call(harness, params);
+    }
+    let p: Params = crate::decode(params)?;
+    crate::directory(&p.project)?;
+    crate::directory(&p.home)?;
+    if !crate::valid_environment_names(&p.settings.environment_names) {
+        return Err(Error::invalid());
+    }
+    let overrides = p
+        .settings
+        .environment_names
+        .iter()
+        .any(|name| crate::ambient::auth_override(harness, name));
+    match p.settings.view.as_deref() {
+        Some("hooks") => {
+            let locations = crate::hook_inventory::Locations {};
+            let mut inventory =
+                crate::hook_inventory::collect_for(&p.project, harness, &locations)?;
+            if overrides {
+                inventory.unscanned_harness = Some(harness.into());
+                inventory.unreadable.push("native environment changes configuration scope; default-scope inventory is incomplete".into());
+            }
+            for facts in &mut inventory.settings {
+                facts.approvals_widened = Some(facts.widens_approvals());
+            }
+            for server in &mut inventory.mcp_servers {
+                server.command = format!(
+                    "<native command sha256:{}>",
+                    crate::util::digest_bytes(server.command.as_bytes())
+                );
+            }
+            return Ok(serde_json::to_value(inventory)?);
+        }
+        Some("private_fingerprints") => {
+            if overrides {
+                return Err(Error::invalid());
+            }
+            let paths: &[&str] = match harness {
+                "codex" => &[".codex/config.toml"],
+
+                _ => return Err(Error::invalid()),
+            };
+            let mut fingerprints = serde_json::Map::new();
+            for (index, relative) in paths.iter().enumerate() {
+                let path = p.home.join(relative);
+                if let Some(bytes) = crate::files::read(&path)? {
+                    fingerprints.insert(
+                        format!("native:{harness}:{index}"),
+                        json!(crate::util::digest_bytes(&bytes)),
+                    );
+                }
+            }
+            return Ok(json!({"fingerprints":fingerprints}));
+        }
+        None | Some("inventory") => (),
+        _ => return Err(Error::invalid()),
+    }
+
+    let (context, agents, skills, configs): (&[&str], &[&str], &[&str], &[&str]) = match harness {
+        "codex" => (
+            &["AGENTS.md", "AGENTS.override.md"],
+            &[".codex/agents"],
+            &[".agents/skills"],
+            &[".codex/config.toml", ".codex/hooks.json"],
+        ),
+
+        _ => return Err(Error::invalid()),
+    };
+    let mut entries = Vec::new();
+    for (kind, paths) in [
+        ("context", context),
+        ("agents", agents),
+        ("skills", skills),
+        ("configuration", configs),
+    ] {
+        for relative in paths {
+            let path = p.project.join(relative);
+            files::check_components(&path)?;
+            let present = match std::fs::symlink_metadata(&path) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(_) => return Err(Error::invalid()),
+            };
+            entries.push(json!({"kind":kind,"path":path,"present":present,"loaded":"unknown"}));
+        }
+    }
+    let global: &[&str] = match harness {
+        "codex" => &[
+            ".codex/config.toml",
+            ".codex/hooks.json",
+            ".codex/AGENTS.md",
+            ".codex/agents",
+            ".agents/skills",
+        ],
+
+        _ => &[],
+    };
+    for relative in global {
+        let path = p.home.join(relative);
+        files::check_components(&path)?;
+        let present = match std::fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(_) => return Err(Error::invalid()),
+        };
+        entries
+            .push(json!({"kind":"native_global","path":path,"present":present,"loaded":"unknown"}));
+    }
+    let imported = if let Some(import) = p.import {
+        if !import.path.starts_with(&p.project) || import.path == p.project {
+            return Err(Error::invalid());
+        }
+        Some(import_agent(harness, &import.path, &import.format)?)
+    } else {
+        None
+    };
+    Ok(
+        json!({"sources":entries,"imported":imported,"activation":"none","coverage":"recognized project and native home paths; synchronized and overridden context remains unknown"}),
+    )
+}
+fn import_agent(harness: &str, path: &Path, format: &str) -> Result<Value> {
+    let bytes = files::read(path)?.ok_or_else(Error::invalid)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| Error::invalid())?;
+    let (body, model, settings) = match (harness, format) {
+        ("codex", "codex-agent") => (text.to_owned(), Value::Null, json!({})),
+
+        _ => return Err(Error::invalid()),
+    };
+    if body.trim().is_empty() || (!model.is_null() && !model.is_string()) {
+        return Err(Error::invalid());
+    }
+    // Settings are reported as declared fields only, never interpreted as grants.
+    let fields = settings
+        .as_object()
+        .ok_or_else(Error::invalid)?
+        .keys()
+        .collect::<Vec<_>>();
+    Ok(
+        json!({"path":path,"format":format,"instructions":body,"model":model,"declared_setting_fields":fields,"sha256":crate::util::digest_bytes(&bytes),"settings_applied":false}),
+    )
+}
