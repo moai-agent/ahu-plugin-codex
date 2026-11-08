@@ -61,6 +61,9 @@ Commit the reviewed grant before activation:
 git add .agents/ahu/plugins/harness-codex.md
 git commit -m 'Grant codex native runtime access'
 ahu plugins enable harness-codex
+git diff -- .agents/ahu/plugins/harness-codex.md
+git add .agents/ahu/plugins/harness-codex.md
+git commit -m 'Enable reviewed codex runtime'
 ahu plugins list
 ahu setup
 ```
